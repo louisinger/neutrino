@@ -948,6 +948,88 @@ func (s *ChainService) GetBlock(blockHash chainhash.Hash,
 	return foundBlock, nil
 }
 
+// GetBlock gets a block by requesting it from the network, one peer at a
+// time, until one answers. If the block is found in the cache, it will be
+// returned immediately.
+func (s *ChainService) GetTx(txHash chainhash.Hash,
+	options ...QueryOption) (*btcutil.Tx, error) {
+
+	// Starting with the set of default options, we'll apply any specified
+	// functional options to the query so that we can check what inv type
+	// to use.
+	qo := defaultQueryOptions()
+	qo.applyQueryOptions(options...)
+	invType := wire.InvTypeTx
+
+	// Create an inv vector for getting this block.
+	inv := wire.NewInvVect(invType, &txHash)
+
+	// Construct the appropriate getdata message to fetch the target block.
+	getData := wire.NewMsgGetData()
+	_ = getData.AddInvVect(inv)
+
+	var foundTx *btcutil.Tx
+
+	// handleResp will be called for each message received from a peer. It
+	// will be used to signal to the work manager whether progress has been
+	// made or not.
+	handleResp := func(req, resp wire.Message, peer string) query.Progress {
+		// The request must have been a "getdata" msg.
+		_, ok := req.(*wire.MsgGetData)
+		if !ok {
+			return noProgress
+		}
+
+		// We're only interested in "block" responses.
+		response, ok := resp.(*wire.MsgTx)
+		if !ok {
+			return noProgress
+		}
+
+		// If this isn't the block we asked for, ignore it.
+		if response.TxHash() != txHash {
+			return noProgress
+		}
+		foundTx = btcutil.NewTx(response)
+
+		return query.Progress{
+			Finished:   true,
+			Progressed: true,
+		}
+	}
+
+	// Prepare the query request.
+	request := &query.Request{
+		Req:        getData,
+		HandleResp: handleResp,
+	}
+
+	// Prepare the query options.
+	queryOpts := []query.QueryOption{
+		query.Encoding(qo.encoding),
+		query.NumRetries(qo.numRetries),
+		query.Cancel(s.quit),
+	}
+
+	// Send the request to the work manager and await a response.
+	errChan := s.workManager.Query([]*query.Request{request}, queryOpts...)
+	select {
+	case err := <-errChan:
+		if err != nil {
+			return nil, err
+		}
+	case <-s.quit:
+		return nil, ErrShuttingDown
+	}
+
+	if foundTx == nil {
+		return nil, fmt.Errorf("couldn't retrieve tx %s from "+
+			"network", txHash)
+	}
+
+	return foundTx, nil
+}
+
 // sendTransaction sends a transaction to all peers. It returns an error if any
 // peer rejects the transaction.
 //
